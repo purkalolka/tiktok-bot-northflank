@@ -61,11 +61,14 @@ job_queue: "queue.Queue[dict]" = queue.Queue()
 _seen_updates = set()
 _seen_lock = threading.Lock()
 
-# --- Statistics (in-memory + stats.json next to app.py) -----------------
-# One instance only, one worker thread, so a plain dict + file is
-# enough for a test bot. A redeploy wipes the file; stats are best
-# effort, not billing-grade. No chat ids are ever sent anywhere
-# except back to the admin panel.
+# --- Statistics: PostgreSQL if DATABASE_URL is set, else JSON -----
+# DATABASE_URL comes from the Northflank secret group linked to the
+# bot-stats addon; it is never in code or git. If the DB is missing
+# or unreachable, stats fall back to the old in-memory + stats.json
+# behaviour so a DB outage never breaks downloads. Chat ids are
+# stored only to know who to broadcast to; they are never sent
+# anywhere except back to the admin panel (as counts, not ids).
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats.json")
 _stats_lock = threading.Lock()
 _stats = {
@@ -73,6 +76,49 @@ _stats = {
     "success": 0, "failed": 0, "fast_path": 0, "fallback": 0,
     "broadcasts": 0,
 }
+_COUNTER_KEYS = ("starts", "requests", "success", "failed", "fast_path", "fallback", "broadcasts")
+_db_conn = None
+_db_ok = False
+
+
+def _db_connect():
+    """Return a live connection, reconnecting once if it died."""
+    global _db_conn, _db_ok
+    if not DATABASE_URL:
+        return None
+    try:
+        import psycopg
+        if _db_conn is not None:
+            try:
+                with _db_conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                return _db_conn
+            except Exception:
+                _db_conn = None
+        _db_conn = psycopg.connect(DATABASE_URL, autocommit=True, connect_timeout=5)
+        with _db_conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS users ("
+                "chat_id BIGINT PRIMARY KEY, "
+                "first_seen TIMESTAMPTZ DEFAULT now(), "
+                "last_seen TIMESTAMPTZ DEFAULT now())"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS counters ("
+                "key TEXT PRIMARY KEY, value BIGINT NOT NULL DEFAULT 0)"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS daily_events ("
+                "day DATE NOT NULL, key TEXT NOT NULL, value BIGINT NOT NULL DEFAULT 0, "
+                "PRIMARY KEY (day, key))"
+            )
+        _db_ok = True
+        return _db_conn
+    except Exception as exc:  # noqa: BLE001 - DB must never break the bot
+        print(f"db unavailable, using JSON fallback: {exc}", flush=True)
+        _db_conn = None
+        _db_ok = False
+        return None
 
 
 def _load_stats():
@@ -97,22 +143,109 @@ def _save_stats():
 
 def record_user(chat_id):
     with _stats_lock:
+        conn = _db_connect()
+        if conn is not None:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO users (chat_id) VALUES (%s) "
+                        "ON CONFLICT (chat_id) DO UPDATE SET last_seen = now()",
+                        (chat_id,),
+                    )
+                return
+            except Exception as exc:  # noqa: BLE001
+                print(f"db record_user failed, using JSON fallback: {exc}", flush=True)
         if chat_id not in _stats["users"]:
             _stats["users"].append(chat_id)
             _save_stats()
 
 
 def record_stat(key, amount=1):
+    if key not in _COUNTER_KEYS:
+        return
     with _stats_lock:
+        conn = _db_connect()
+        if conn is not None:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO counters (key, value) VALUES (%s, %s) "
+                        "ON CONFLICT (key) DO UPDATE SET value = counters.value + EXCLUDED.value",
+                        (key, amount),
+                    )
+                    cur.execute(
+                        "INSERT INTO daily_events (day, key, value) VALUES (CURRENT_DATE, %s, %s) "
+                        "ON CONFLICT (day, key) DO UPDATE SET value = daily_events.value + EXCLUDED.value",
+                        (key, amount),
+                    )
+                return
+            except Exception as exc:  # noqa: BLE001
+                print(f"db record_stat failed, using JSON fallback: {exc}", flush=True)
         _stats[key] = _stats.get(key, 0) + amount
         _save_stats()
 
 
+def _db_stats_snapshot():
+    """Return (users, counters dict, today dict, last7 dict) or None."""
+    conn = _db_connect()
+    if conn is None:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM users")
+            users = cur.fetchone()[0]
+            cur.execute("SELECT key, value FROM counters")
+            counters = dict(cur.fetchall())
+            cur.execute(
+                "SELECT key, value FROM daily_events WHERE day = CURRENT_DATE"
+            )
+            today = dict(cur.fetchall())
+            cur.execute(
+                "SELECT key, COALESCE(SUM(value), 0) FROM daily_events "
+                "WHERE day >= CURRENT_DATE - INTERVAL '6 days' GROUP BY key"
+            )
+            last7 = dict(cur.fetchall())
+        return users, counters, today, last7
+    except Exception as exc:  # noqa: BLE001
+        print(f"db stats read failed: {exc}", flush=True)
+        return None
+
+
+def broadcast_user_ids():
+    with _stats_lock:
+        conn = _db_connect()
+        if conn is not None:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT chat_id FROM users")
+                    return [row[0] for row in cur.fetchall()]
+            except Exception as exc:  # noqa: BLE001
+                print(f"db broadcast list failed, using JSON fallback: {exc}", flush=True)
+        return list(_stats["users"])
+
+
 def stats_text():
     with _stats_lock:
+        snap = _db_stats_snapshot()
+        if snap is not None:
+            users, counters, today, last7 = snap
+            get = lambda d, k: d.get(k, 0)
+            return (
+                "📊 Статистика бота (PostgreSQL)\n\n"
+                f"👥 Пользователей: {users}\n"
+                f"▶️ /start: {get(counters, 'starts')}\n"
+                f"🔗 Запросов на скачивание: {get(counters, 'requests')}\n"
+                f"✅ Успешно: {get(counters, 'success')}\n"
+                f"❌ Не удалось: {get(counters, 'failed')}\n"
+                f"⚡ Быстрый путь (tikwm): {get(counters, 'fast_path')}\n"
+                f"📥 Запасной путь (yt-dlp/tikwm): {get(counters, 'fallback')}\n"
+                f"📢 Рассылок: {get(counters, 'broadcasts')}\n\n"
+                f"📅 Сегодня: запросов {get(today, 'requests')}, успешно {get(today, 'success')}\n"
+                f"🗓 За 7 дней: запросов {get(last7, 'requests')}, успешно {get(last7, 'success')}"
+            )
         users = len(_stats["users"])
         return (
-            "📊 Статистика бота\n\n"
+            "📊 Статистика бота (файл, БД недоступна)\n\n"
             f"👥 Пользователей: {users}\n"
             f"▶️ /start: {_stats['starts']}\n"
             f"🔗 Запросов на скачивание: {_stats['requests']}\n"
@@ -397,8 +530,7 @@ def _do_broadcast(job):
     admin_id = job["admin_chat_id"]
     from_chat_id = job["from_chat_id"]
     message_id = job["message_id"]
-    with _stats_lock:
-        targets = [u for u in _stats["users"] if u != admin_id]
+    targets = [u for u in broadcast_user_ids() if u != admin_id]
     tg_send_message(admin_id, f"📢 Рассылка началась. Получателей: {len(targets)}")
     sent = failed = 0
     for target in targets:
