@@ -18,25 +18,33 @@ Why this shape, and how it beats scale-to-zero:
     temp dir and are deleted right after sending.
 
 Secrets: BOT_TOKEN and WEBHOOK_SECRET come ONLY from environment
-variables set in the Koyeb dashboard. Never put the token in code,
-in git, or in chat.
+variables set in the hosting dashboard. Never put the token in code,
+in git, or in chat. ADMIN_ID is also an environment variable: only
+that Telegram user id can open /admin, everyone else is denied.
 """
 
 import os
 import re
 import sys
 import glob
+import json
 import queue
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
+from urllib.parse import quote
 
 import requests
 from flask import Flask, request, jsonify
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+try:
+    ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
+except ValueError:
+    ADMIN_ID = 0
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
 # 48 MB: Telegram Bot API will not accept a video over 50 MB anyway,
@@ -53,22 +61,164 @@ job_queue: "queue.Queue[dict]" = queue.Queue()
 _seen_updates = set()
 _seen_lock = threading.Lock()
 
+# --- Statistics (in-memory + stats.json next to app.py) -----------------
+# One instance only, one worker thread, so a plain dict + file is
+# enough for a test bot. A redeploy wipes the file; stats are best
+# effort, not billing-grade. No chat ids are ever sent anywhere
+# except back to the admin panel.
+STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats.json")
+_stats_lock = threading.Lock()
+_stats = {
+    "users": [], "starts": 0, "requests": 0,
+    "success": 0, "failed": 0, "fast_path": 0, "fallback": 0,
+    "broadcasts": 0,
+}
 
-def tg_send_message(chat_id, text):
+
+def _load_stats():
+    try:
+        with open(STATS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for key in _stats:
+                if key in data:
+                    _stats[key] = data[key]
+    except Exception:
+        pass
+
+
+def _save_stats():
+    try:
+        with open(STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(_stats, f, ensure_ascii=False)
+    except Exception as exc:  # noqa: BLE001 - stats must never break the bot
+        print(f"stats save failed: {exc}", flush=True)
+
+
+def record_user(chat_id):
+    with _stats_lock:
+        if chat_id not in _stats["users"]:
+            _stats["users"].append(chat_id)
+            _save_stats()
+
+
+def record_stat(key, amount=1):
+    with _stats_lock:
+        _stats[key] = _stats.get(key, 0) + amount
+        _save_stats()
+
+
+def stats_text():
+    with _stats_lock:
+        users = len(_stats["users"])
+        return (
+            "📊 Статистика бота\n\n"
+            f"👥 Пользователей: {users}\n"
+            f"▶️ /start: {_stats['starts']}\n"
+            f"🔗 Запросов на скачивание: {_stats['requests']}\n"
+            f"✅ Успешно: {_stats['success']}\n"
+            f"❌ Не удалось: {_stats['failed']}\n"
+            f"⚡ Быстрый путь (tikwm): {_stats['fast_path']}\n"
+            f"📥 Запасной путь (yt-dlp/tikwm): {_stats['fallback']}\n"
+            f"📢 Рассылок: {_stats['broadcasts']}"
+        )
+
+
+_load_stats()
+
+# Admin broadcast mode: when True, the next message from the admin
+# (text, photo, video, document, ...) is copied to every known user.
+_broadcast_waiting = set()
+_broadcast_lock = threading.Lock()
+
+
+def is_admin(user_id):
+    return ADMIN_ID != 0 and user_id == ADMIN_ID
+
+
+def share_keyboard(source_url):
+    """One inline button under a video: opens Telegram's share sheet
+    with the original TikTok link, so the user can forward it to any
+    chat without copying the URL by hand."""
+    share_url = "https://t.me/share/url?url=" + quote(source_url or "", safe="")
+    return {"inline_keyboard": [[{"text": "↗️ Поделиться", "url": share_url}]]}
+
+
+def admin_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "📊 Статистика", "callback_data": "admin_stats"}],
+        [{"text": "📢 Рассылка", "callback_data": "admin_broadcast"}],
+    ]}
+
+
+def admin_back_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "⬅️ Назад в панель", "callback_data": "admin_back"}],
+    ]}
+
+
+def tg_send_message(chat_id, text, reply_markup=None):
     if not TG_API:
         print("No BOT_TOKEN set, cannot send message", flush=True)
         return
     try:
-        requests.post(
-            f"{TG_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=15,
-        )
+        payload = {"chat_id": chat_id, "text": text}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        requests.post(f"{TG_API}/sendMessage", json=payload, timeout=15)
     except Exception as exc:  # noqa: BLE001 - worker must never die
         print(f"sendMessage failed: {exc}", flush=True)
 
 
-def tg_send_video_url(chat_id, video_url, caption):
+def tg_answer_callback(callback_id, text="", show_alert=False):
+    if not TG_API:
+        return
+    try:
+        requests.post(
+            f"{TG_API}/answerCallbackQuery",
+            json={"callback_query_id": callback_id, "text": text, "show_alert": show_alert},
+            timeout=15,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"answerCallbackQuery failed: {exc}", flush=True)
+
+
+def tg_edit_message(chat_id, message_id, text, reply_markup=None):
+    if not TG_API:
+        return
+    try:
+        payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        requests.post(f"{TG_API}/editMessageText", json=payload, timeout=15)
+    except Exception as exc:  # noqa: BLE001
+        print(f"editMessageText failed: {exc}", flush=True)
+
+
+def tg_copy_message(chat_id, from_chat_id, message_id):
+    """Copy (not forward) a message to one user. Returns True on 200."""
+    if not TG_API:
+        return False
+    try:
+        resp = requests.post(
+            f"{TG_API}/copyMessage",
+            json={"chat_id": chat_id, "from_chat_id": from_chat_id, "message_id": message_id},
+            timeout=30,
+        )
+        if resp.status_code == 429:
+            try:
+                wait = resp.json().get("parameters", {}).get("retry_after", 1)
+            except Exception:  # noqa: BLE001
+                wait = 1
+            time.sleep(min(wait, 60))
+            return tg_copy_message(chat_id, from_chat_id, message_id)
+        return resp.status_code == 200
+    except Exception as exc:  # noqa: BLE001
+        print(f"copyMessage failed: {exc}", flush=True)
+        return False
+
+
+def tg_send_video_url(chat_id, video_url, caption, source_url=None):
     """Ask Telegram itself to fetch the video from a direct URL.
 
     This is the fast path: no download to Koyeb and no re-upload
@@ -79,11 +229,10 @@ def tg_send_video_url(chat_id, video_url, caption):
     if not TG_API:
         return False
     try:
-        resp = requests.post(
-            f"{TG_API}/sendVideo",
-            json={"chat_id": chat_id, "video": video_url, "caption": caption[:1024]},
-            timeout=60,
-        )
+        payload = {"chat_id": chat_id, "video": video_url, "caption": caption[:1024]}
+        if source_url:
+            payload["reply_markup"] = share_keyboard(source_url)
+        resp = requests.post(f"{TG_API}/sendVideo", json=payload, timeout=60)
         if resp.status_code == 200:
             return True
         print(f"sendVideo-by-url failed {resp.status_code}: {resp.text[:300]}", flush=True)
@@ -93,15 +242,22 @@ def tg_send_video_url(chat_id, video_url, caption):
         return False
 
 
-def tg_send_video(chat_id, path, caption):
+def tg_send_video(chat_id, path, caption, source_url=None):
     if not TG_API:
         return False
     try:
         with open(path, "rb") as f:
+            data = {"chat_id": chat_id, "caption": caption[:1024]}
+            files = {"video": (os.path.basename(path), f)}
+            if source_url:
+                # files + json reply_markup do not mix: send markup as a
+                # JSON string in the multipart form instead.
+                import json as _json
+                data["reply_markup"] = _json.dumps(share_keyboard(source_url))
             resp = requests.post(
                 f"{TG_API}/sendVideo",
-                data={"chat_id": chat_id, "caption": caption[:1024]},
-                files={"video": (os.path.basename(path), f)},
+                data=data,
+                files=files,
                 timeout=120,
             )
         if resp.status_code == 200:
@@ -216,7 +372,7 @@ def try_tikwm(chat_id, url, tmpdir, data=None):
         path = os.path.join(tmpdir, "video.mp4")
         if download_file(play, path):
             title = (data.get("title") or "").strip()
-            return tg_send_video(chat_id, path, title or "Готово ✅")
+            return tg_send_video(chat_id, path, title or "Готово ✅", source_url=url)
         print("tikwm play download failed or too large", flush=True)
         return False
 
@@ -237,11 +393,35 @@ def try_tikwm(chat_id, url, tmpdir, data=None):
     return False
 
 
+def _do_broadcast(job):
+    admin_id = job["admin_chat_id"]
+    from_chat_id = job["from_chat_id"]
+    message_id = job["message_id"]
+    with _stats_lock:
+        targets = [u for u in _stats["users"] if u != admin_id]
+    tg_send_message(admin_id, f"📢 Рассылка началась. Получателей: {len(targets)}")
+    sent = failed = 0
+    for target in targets:
+        if tg_copy_message(target, from_chat_id, message_id):
+            sent += 1
+        else:
+            failed += 1
+        time.sleep(0.05)
+    record_stat("broadcasts")
+    tg_send_message(admin_id, f"📢 Рассылка завершена.\n✅ Отправлено: {sent}\n❌ Не доставлено: {failed}")
+
+
 def process_job(job):
+    if job.get("type") == "broadcast":
+        _do_broadcast(job)
+        return
+
     chat_id = job["chat_id"]
     text = job.get("text", "") or ""
+    record_user(chat_id)
 
     if text.strip() in ("/start", "/help"):
+        record_stat("starts")
         tg_send_message(
             chat_id,
             "Пришли ссылку на видео из TikTok — я скачаю его без водяного знака и пришлю сюда.",
@@ -253,6 +433,7 @@ def process_job(job):
         tg_send_message(chat_id, "Это не похоже на ссылку на TikTok. Пришли ссылку на видео.")
         return
 
+    record_stat("requests")
     url = resolve_url(match.group(0))
     # NOTE: "Качаю…" is already sent by the webhook handler, so the
     # user sees it immediately even while a previous download is
@@ -266,7 +447,9 @@ def process_job(job):
         play_url = (tikwm_data.get("play") or tikwm_data.get("wmplay") or "") if tikwm_data else ""
         if play_url:
             title = (tikwm_data.get("title") or "").strip()
-            if tg_send_video_url(chat_id, play_url, title or "Готово ✅"):
+            if tg_send_video_url(chat_id, play_url, title or "Готово ✅", source_url=url):
+                record_stat("success")
+                record_stat("fast_path")
                 return
             print("sendVideo-by-url failed, falling back to download", flush=True)
         out_tpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
@@ -295,20 +478,30 @@ def process_job(job):
             # (reuses the API result from the fast path above).
             tg_send_message(chat_id, "yt-dlp не справился, пробую запасной способ…")
             if try_tikwm(chat_id, url, tmpdir, data=tikwm_data):
+                record_stat("success")
+                record_stat("fallback")
                 return
+            record_stat("failed")
             tg_send_message(chat_id, "Не получилось скачать это видео. Возможно, оно приватное, удалено или слишком большое (>50 МБ).")
             return
 
         path = files[0]
         if os.path.getsize(path) > MAX_BYTES:
+            record_stat("failed")
             tg_send_message(chat_id, "Видео больше 50 МБ — Telegram не примет его через Bot API.")
             return
 
-        if not tg_send_video(chat_id, path, "Готово ✅"):
+        if not tg_send_video(chat_id, path, "Готово ✅", source_url=url):
+            record_stat("failed")
             tg_send_message(chat_id, "Скачал, но не смог отправить видео в Telegram. Попробуй ещё раз.")
+        else:
+            record_stat("success")
+            record_stat("fallback")
     except subprocess.TimeoutExpired:
+        record_stat("failed")
         tg_send_message(chat_id, "Скачивание заняло слишком долго, попробуй ещё раз.")
     except Exception as exc:  # noqa: BLE001
+        record_stat("failed")
         print(f"job failed: {exc}", flush=True)
         tg_send_message(chat_id, "Что-то пошло не так при скачивании. Попробуй ещё раз.")
     finally:
@@ -358,22 +551,72 @@ def webhook():
             if len(_seen_updates) > 1000:
                 _seen_updates.clear()
 
+    # --- Inline buttons (admin panel) -------------------------------
+    callback = update.get("callback_query") or {}
+    if callback:
+        user = callback.get("from") or {}
+        cb_chat = (callback.get("message") or {}).get("chat") or {}
+        cb_message_id = (callback.get("message") or {}).get("message_id")
+        data = callback.get("data", "") or ""
+        if not is_admin(user.get("id")):
+            tg_answer_callback(callback.get("id", ""), "Нет доступа.", show_alert=True)
+            return jsonify({"ok": True}), 200
+        tg_answer_callback(callback.get("id", ""))
+        if data == "admin_stats":
+            tg_edit_message(cb_chat.get("id"), cb_message_id, stats_text(), reply_markup=admin_back_keyboard())
+        elif data == "admin_broadcast":
+            with _broadcast_lock:
+                _broadcast_waiting.add(cb_chat.get("id"))
+            tg_edit_message(
+                cb_chat.get("id"), cb_message_id,
+                "📢 Рассылка\n\nПришли следующее сообщение (текст, фото, видео — что угодно), и я разошлю его копию всем пользователям бота.\n\n/cancel — отменить.",
+                reply_markup={"inline_keyboard": [[{"text": "❌ Отменить рассылку", "callback_data": "admin_cancel"}]]},
+            )
+        elif data == "admin_back":
+            with _broadcast_lock:
+                _broadcast_waiting.discard(cb_chat.get("id"))
+            tg_edit_message(cb_chat.get("id"), cb_message_id, "🛠 Админ-панель", reply_markup=admin_keyboard())
+        elif data == "admin_cancel":
+            with _broadcast_lock:
+                _broadcast_waiting.discard(cb_chat.get("id"))
+            tg_edit_message(cb_chat.get("id"), cb_message_id, "Рассылка отменена.", reply_markup=admin_back_keyboard())
+        return jsonify({"ok": True}), 200
+
     message = update.get("message") or {}
     chat = message.get("chat") or {}
     if chat.get("id") is not None:
         text = message.get("text", "") or ""
+        sender = (message.get("from") or {}).get("id")
+        record_user(chat["id"])
         # Instant replies bypass the download queue entirely.
-        # Previously /start was queued behind a slow download, so
-        # it only arrived after the download finished (or looked
-        # lost) — that is why /start answered "every other time"
-        # even though CPU/RAM were idle. The webhook runs on
-        # gunicorn threads, so this send does not wait for the
-        # single download worker.
         if text.strip() in ("/start", "/help"):
+            record_stat("starts")
             tg_send_message(
                 chat["id"],
                 "Пришли ссылку на видео из TikTok — я скачаю его без водяного знака и пришлю сюда.",
             )
+        elif text.strip() == "/admin":
+            if is_admin(sender):
+                tg_send_message(chat["id"], "🛠 Админ-панель", reply_markup=admin_keyboard())
+            else:
+                tg_send_message(chat["id"], "Нет доступа.")
+        elif text.strip() == "/cancel":
+            with _broadcast_lock:
+                waiting = chat["id"] in _broadcast_waiting
+                _broadcast_waiting.discard(chat["id"])
+            tg_send_message(chat["id"], "Рассылка отменена." if waiting else "Отменять нечего.")
+        elif is_admin(sender) and chat["id"] in _broadcast_waiting:
+            # Admin's next message becomes the broadcast. Queue it so
+            # the webhook still returns 200 immediately.
+            with _broadcast_lock:
+                _broadcast_waiting.discard(chat["id"])
+            job_queue.put({
+                "type": "broadcast",
+                "admin_chat_id": chat["id"],
+                "from_chat_id": chat["id"],
+                "message_id": message.get("message_id"),
+            })
+            tg_send_message(chat["id"], "Принято, запускаю рассылку…")
         elif not TIKTOK_RE.search(text):
             tg_send_message(chat["id"], "Это не похоже на ссылку на TikTok. Пришли ссылку на видео.")
         else:
