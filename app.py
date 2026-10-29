@@ -281,7 +281,136 @@ def admin_keyboard():
     return {"inline_keyboard": [
         [{"text": "📊 Статистика", "callback_data": "admin_stats"}],
         [{"text": "📢 Рассылка", "callback_data": "admin_broadcast"}],
+        [{"text": "🖥 Нода", "callback_data": "admin_node"}],
     ]}
+
+
+def _read_int_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            value = f.read().strip()
+        return None if value in ("max", "") else int(value)
+    except Exception:
+        return None
+
+
+def _fmt_bytes(n):
+    if n is None:
+        return "?"
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "Б" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} ТБ"
+
+
+def _fmt_uptime(seconds):
+    seconds = int(seconds)
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    if days:
+        return f"{days} д {hours} ч {minutes} мин"
+    if hours:
+        return f"{hours} ч {minutes} мин"
+    return f"{minutes} мин {seconds} сек"
+
+
+_START_TIME = time.time()
+
+
+def node_stats_text():
+    """Stats of the container the bot actually runs in.
+
+    Stdlib only, no psutil: cgroup v2 files give the real container
+    limits (a plain /proc/meminfo would show the whole host, which
+    would lie about a 256 MB service). Falls back gracefully when
+    a file is missing (cgroup v1 paths, or no cgroup at all).
+    """
+    import platform
+    import socket
+
+    mem_used = _read_int_file("/sys/fs/cgroup/memory.current")
+    if mem_used is None:
+        mem_used = _read_int_file("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    mem_limit = _read_int_file("/sys/fs/cgroup/memory.max")
+    if mem_limit is None:
+        mem_limit = _read_int_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    if mem_limit is None or mem_used is None:
+        # No cgroup (local run, not Northflank): fall back to host
+        # meminfo. In the Northflank container the cgroup branch
+        # above wins, so this never hides the real 256 MB limit.
+        try:
+            total = avail = None
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        total = int(line.split()[1]) * 1024
+                    elif line.startswith("MemAvailable:"):
+                        avail = int(line.split()[1]) * 1024
+            if total is not None:
+                mem_limit = mem_limit or total
+                mem_used = mem_used or (total - avail if avail is not None else None)
+        except Exception:
+            pass
+    proc_rss = None
+    proc_cpu_sec = None
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    proc_rss = int(line.split()[1]) * 1024
+                    break
+    except Exception:
+        pass
+    try:
+        with open("/proc/self/stat", "r", encoding="utf-8") as f:
+            parts = f.read().rsplit(")", 1)[1].split()
+            # fields after comm: utime is #14 overall, #12 after comm
+            utime, stime = int(parts[11]), int(parts[12])
+            proc_cpu_sec = (utime + stime) / os.sysconf("SC_CLK_TCK")
+    except Exception:
+        pass
+    try:
+        load1, load5, load15 = os.getloadavg()
+        load_text = f"{load1:.2f} / {load5:.2f} / {load15:.2f}"
+    except Exception:
+        load_text = "?"
+    try:
+        disk = shutil.disk_usage("/")
+        disk_text = f"{_fmt_bytes(disk.used)} / {_fmt_bytes(disk.total)} ({disk.used * 100 // disk.total}%)"
+    except Exception:
+        disk_text = "?"
+    uptime = time.time() - _START_TIME
+    mem_pct = f" ({mem_used * 100 // mem_limit}%)" if mem_used and mem_limit else ""
+    lines = [
+        "🖥 Нода (контейнер бота)",
+        "",
+        f"🆔 Под: {socket.gethostname()}",
+        f"🐍 Python: {platform.python_version()}",
+        f"⏱ Аптайм процесса: {_fmt_uptime(uptime)}",
+        f"🧠 Память контейнера: {_fmt_bytes(mem_used)} / {_fmt_bytes(mem_limit)}{mem_pct}",
+        f"🧠 Память процесса (RSS): {_fmt_bytes(proc_rss)}",
+    ]
+    if proc_cpu_sec is not None:
+        if uptime >= 10:
+            lines.append(
+                f"⚙️ CPU процесса: {proc_cpu_sec:.1f} сек "
+                f"(в среднем {proc_cpu_sec / uptime * 100:.1f}% за жизнь процесса)"
+            )
+        else:
+            # Uptime is shorter than the CPU time already spent on
+            # interpreter startup before _START_TIME was set, so an
+            # average here would be absurd (thousands of percent).
+            lines.append(f"⚙️ CPU процесса: {proc_cpu_sec:.1f} сек")
+    lines += [
+        f"📈 Load average (1/5/15 мин): {load_text}",
+        f"💾 Диск /: {disk_text}",
+        f"📥 Очередь скачиваний: {job_queue.qsize()}",
+        f"🧵 Потоков: {threading.active_count()}",
+        f"🗄 База: {'PostgreSQL' if DATABASE_URL else 'нет (JSON-режим)'}",
+    ]
+    return "\n".join(lines)
 
 
 def admin_back_keyboard():
@@ -696,6 +825,8 @@ def webhook():
         tg_answer_callback(callback.get("id", ""))
         if data == "admin_stats":
             tg_edit_message(cb_chat.get("id"), cb_message_id, stats_text(), reply_markup=admin_back_keyboard())
+        elif data == "admin_node":
+            tg_edit_message(cb_chat.get("id"), cb_message_id, node_stats_text(), reply_markup=admin_back_keyboard())
         elif data == "admin_broadcast":
             with _broadcast_lock:
                 _broadcast_waiting.add(cb_chat.get("id"))
