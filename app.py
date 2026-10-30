@@ -25,6 +25,7 @@ that Telegram user id can open /admin, everyone else is denied.
 
 import os
 import re
+import secrets
 import sys
 import glob
 import json
@@ -34,8 +35,6 @@ import subprocess
 import tempfile
 import threading
 import time
-from urllib.parse import quote
-
 import requests
 from flask import Flask, request, jsonify
 
@@ -111,6 +110,10 @@ def _db_connect():
                 "CREATE TABLE IF NOT EXISTS daily_events ("
                 "day DATE NOT NULL, key TEXT NOT NULL, value BIGINT NOT NULL DEFAULT 0, "
                 "PRIMARY KEY (day, key))"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS shared_videos ("
+                "token TEXT PRIMARY KEY, file_id TEXT NOT NULL)"
             )
         _db_ok = True
         return _db_conn
@@ -269,12 +272,68 @@ def is_admin(user_id):
     return ADMIN_ID != 0 and user_id == ADMIN_ID
 
 
-def share_keyboard(source_url):
-    """One inline button under a video: opens Telegram's share sheet
-    with the original TikTok link, so the user can forward it to any
-    chat without copying the URL by hand."""
-    share_url = "https://t.me/share/url?url=" + quote(source_url or "", safe="")
-    return {"inline_keyboard": [[{"text": "↗️ Поделиться", "url": share_url}]]}
+def share_keyboard(token):
+    """One inline button under a video: tapping it opens Telegram's
+    chat picker with the bot's inline query prefilled. The user then
+    taps the video result and the video file itself (not a link, no
+    caption) lands in the chosen chat.
+
+    This is the only way an inline button can share media itself:
+    a plain url button can only share a link (t.me/share/url), and
+    a callback button cannot open Telegram's share sheet at all.
+    Requires inline mode enabled for the bot in BotFather, otherwise
+    tapping the button does nothing.
+    """
+    return {"inline_keyboard": [[{"text": "↗️ Поделиться", "switch_inline_query": token}]]}
+
+
+# token -> Telegram file_id of a video this bot already sent.
+# The token is what the share button puts in the inline query, so
+# the inline handler can answer with that exact file (cached video).
+# Persisted in PostgreSQL when available (so a restart does not
+# break old share buttons), with an in-memory fallback.
+_share_map = {}
+
+
+def _register_share(file_id):
+    """Store file_id under a short token, return the token."""
+    with _stats_lock:
+        token = secrets.token_hex(4)
+        while token in _share_map:
+            token = secrets.token_hex(4)
+        _share_map[token] = file_id
+        conn = _db_connect()
+        if conn is not None:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO shared_videos (token, file_id) VALUES (%s, %s) "
+                        "ON CONFLICT (token) DO NOTHING",
+                        (token, file_id),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                print(f"db share store failed: {exc}", flush=True)
+        return token
+
+
+def _lookup_share(token):
+    if not token:
+        return None
+    with _stats_lock:
+        if token in _share_map:
+            return _share_map[token]
+        conn = _db_connect()
+        if conn is not None:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT file_id FROM shared_videos WHERE token = %s", (token,))
+                    row = cur.fetchone()
+                if row:
+                    _share_map[token] = row[0]
+                    return row[0]
+            except Exception as exc:  # noqa: BLE001
+                print(f"db share lookup failed: {exc}", flush=True)
+        return None
 
 
 def admin_keyboard():
@@ -457,6 +516,34 @@ def tg_edit_message(chat_id, message_id, text, reply_markup=None):
         print(f"editMessageText failed: {exc}", flush=True)
 
 
+def tg_edit_reply_markup(chat_id, message_id, reply_markup):
+    """Attach (or replace) the inline keyboard of a sent message."""
+    if not TG_API:
+        return
+    try:
+        requests.post(
+            f"{TG_API}/editMessageReplyMarkup",
+            json={"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup},
+            timeout=15,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"editMessageReplyMarkup failed: {exc}", flush=True)
+
+
+def tg_answer_inline_query(inline_query_id, results):
+    if not TG_API:
+        return
+    try:
+        requests.post(
+            f"{TG_API}/answerInlineQuery",
+            json={"inline_query_id": inline_query_id, "results": results,
+                  "cache_time": 0, "is_personal": True},
+            timeout=15,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"answerInlineQuery failed: {exc}", flush=True)
+
+
 def tg_copy_message(chat_id, from_chat_id, message_id):
     """Copy (not forward) a message to one user. Returns True on 200."""
     if not TG_API:
@@ -480,6 +567,25 @@ def tg_copy_message(chat_id, from_chat_id, message_id):
         return False
 
 
+def _attach_share_button(chat_id, resp):
+    """After a video is sent, attach the share button to it.
+
+    The button needs the video's Telegram file_id, which only
+    exists after sendVideo succeeds, so it cannot be attached in
+    the send call itself: send first, then edit the markup. The
+    button carries a short token, not the file_id (file_ids are
+    long and must not be exposed in a keyboard).
+    """
+    try:
+        result = resp.json().get("result") or {}
+        file_id = (result.get("video") or {}).get("file_id")
+        message_id = result.get("message_id")
+        if file_id and message_id:
+            tg_edit_reply_markup(chat_id, message_id, share_keyboard(_register_share(file_id)))
+    except Exception as exc:  # noqa: BLE001
+        print(f"attach share button failed: {exc}", flush=True)
+
+
 def tg_send_video_url(chat_id, video_url, caption, source_url=None):
     """Ask Telegram itself to fetch the video from a direct URL.
 
@@ -492,10 +598,9 @@ def tg_send_video_url(chat_id, video_url, caption, source_url=None):
         return False
     try:
         payload = {"chat_id": chat_id, "video": video_url, "caption": caption[:1024]}
-        if source_url:
-            payload["reply_markup"] = share_keyboard(source_url)
         resp = requests.post(f"{TG_API}/sendVideo", json=payload, timeout=60)
         if resp.status_code == 200:
+            _attach_share_button(chat_id, resp)
             return True
         print(f"sendVideo-by-url failed {resp.status_code}: {resp.text[:300]}", flush=True)
         return False
@@ -511,11 +616,6 @@ def tg_send_video(chat_id, path, caption, source_url=None):
         with open(path, "rb") as f:
             data = {"chat_id": chat_id, "caption": caption[:1024]}
             files = {"video": (os.path.basename(path), f)}
-            if source_url:
-                # files + json reply_markup do not mix: send markup as a
-                # JSON string in the multipart form instead.
-                import json as _json
-                data["reply_markup"] = _json.dumps(share_keyboard(source_url))
             resp = requests.post(
                 f"{TG_API}/sendVideo",
                 data=data,
@@ -523,6 +623,7 @@ def tg_send_video(chat_id, path, caption, source_url=None):
                 timeout=120,
             )
         if resp.status_code == 200:
+            _attach_share_button(chat_id, resp)
             return True
         print(f"sendVideo failed {resp.status_code}: {resp.text[:300]}", flush=True)
         return False
@@ -811,6 +912,22 @@ def webhook():
             _seen_updates.add(update_id)
             if len(_seen_updates) > 1000:
                 _seen_updates.clear()
+
+    # --- Inline mode: share button -> video file itself ------------
+    # Tapping "Поделиться" opens the chat picker with this query
+    # (the share token). Answer with the cached video: the user
+    # taps the result and the video, with no link and no caption,
+    # lands in the chosen chat.
+    inline = update.get("inline_query") or {}
+    if inline:
+        token = (inline.get("query") or "").strip()
+        file_id = _lookup_share(token)
+        results = []
+        if file_id:
+            results = [{"type": "video", "id": token, "video_file_id": file_id,
+                        "title": "Видео"}]
+        tg_answer_inline_query(inline.get("id", ""), results)
+        return jsonify({"ok": True}), 200
 
     # --- Inline buttons (admin panel) -------------------------------
     callback = update.get("callback_query") or {}
