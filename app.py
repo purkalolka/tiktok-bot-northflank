@@ -73,9 +73,9 @@ _stats_lock = threading.Lock()
 _stats = {
     "users": [], "starts": 0, "requests": 0,
     "success": 0, "failed": 0, "fast_path": 0, "fallback": 0,
-    "broadcasts": 0,
+    "broadcasts": 0, "photos": 0,
 }
-_COUNTER_KEYS = ("starts", "requests", "success", "failed", "fast_path", "fallback", "broadcasts")
+_COUNTER_KEYS = ("starts", "requests", "success", "failed", "fast_path", "fallback", "broadcasts", "photos")
 _db_conn = None
 _db_ok = False
 
@@ -114,6 +114,11 @@ def _db_connect():
             cur.execute(
                 "CREATE TABLE IF NOT EXISTS shared_videos ("
                 "token TEXT PRIMARY KEY, file_id TEXT NOT NULL)"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS shared_media ("
+                "token TEXT NOT NULL, ord INT NOT NULL, kind TEXT NOT NULL, "
+                "file_id TEXT NOT NULL, PRIMARY KEY (token, ord))"
             )
         _db_ok = True
         return _db_conn
@@ -242,6 +247,7 @@ def stats_text():
                 f"❌ Не удалось: {get(counters, 'failed')}\n"
                 f"⚡ Быстрый путь (tikwm): {get(counters, 'fast_path')}\n"
                 f"📥 Запасной путь (yt-dlp/tikwm): {get(counters, 'fallback')}\n"
+                f"🖼 Фото-посты: {get(counters, 'photos')}\n"
                 f"📢 Рассылок: {get(counters, 'broadcasts')}\n\n"
                 f"📅 Сегодня: запросов {get(today, 'requests')}, успешно {get(today, 'success')}\n"
                 f"🗓 За 7 дней: запросов {get(last7, 'requests')}, успешно {get(last7, 'success')}"
@@ -256,6 +262,7 @@ def stats_text():
             f"❌ Не удалось: {_stats['failed']}\n"
             f"⚡ Быстрый путь (tikwm): {_stats['fast_path']}\n"
             f"📥 Запасной путь (yt-dlp/tikwm): {_stats['fallback']}\n"
+            f"🖼 Фото-посты: {_stats['photos']}\n"
             f"📢 Рассылок: {_stats['broadcasts']}"
         )
 
@@ -333,6 +340,59 @@ def _lookup_share(token):
                     return row[0]
             except Exception as exc:  # noqa: BLE001
                 print(f"db share lookup failed: {exc}", flush=True)
+        return None
+
+
+# Multi-item share (photo posts): one token -> a list of
+# (kind, file_id) in order, e.g. photos then audio. A media group
+# cannot carry a keyboard, so the share button lives on a separate
+# message and the inline answer returns every item as its own
+# result: the user taps each one into the chosen chat.
+_share_media_map = {}
+
+
+def _register_share_media(items):
+    """Store [(kind, file_id), ...], return the token."""
+    with _stats_lock:
+        token = secrets.token_hex(4)
+        while token in _share_map or token in _share_media_map:
+            token = secrets.token_hex(4)
+        _share_media_map[token] = list(items)
+        conn = _db_connect()
+        if conn is not None:
+            try:
+                with conn.cursor() as cur:
+                    for i, (kind, file_id) in enumerate(items):
+                        cur.execute(
+                            "INSERT INTO shared_media (token, ord, kind, file_id) "
+                            "VALUES (%s, %s, %s, %s) ON CONFLICT (token, ord) DO NOTHING",
+                            (token, i, kind, file_id),
+                        )
+            except Exception as exc:  # noqa: BLE001
+                print(f"db share media store failed: {exc}", flush=True)
+        return token
+
+
+def _lookup_share_media(token):
+    if not token:
+        return None
+    with _stats_lock:
+        if token in _share_media_map:
+            return _share_media_map[token]
+        conn = _db_connect()
+        if conn is not None:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT kind, file_id FROM shared_media WHERE token = %s ORDER BY ord",
+                        (token,),
+                    )
+                    rows = cur.fetchall()
+                if rows:
+                    _share_media_map[token] = [(k, f) for k, f in rows]
+                    return _share_media_map[token]
+            except Exception as exc:  # noqa: BLE001
+                print(f"db share media lookup failed: {exc}", flush=True)
         return None
 
 
@@ -632,6 +692,147 @@ def tg_send_video(chat_id, path, caption, source_url=None):
         return False
 
 
+def tg_send_media_group(chat_id, image_urls, caption=""):
+    """Send photos as one media group (Telegram fetches the URLs).
+    Returns the list of largest-size photo file_ids, or [] on failure.
+    Media groups cannot carry an inline keyboard, so the share
+    button for a slideshow lives on a separate message (see
+    send_photo_post)."""
+    if not TG_API or not image_urls:
+        return []
+    file_ids = []
+    for chunk_start in range(0, len(image_urls), 10):
+        chunk = image_urls[chunk_start:chunk_start + 10]
+        media = [{"type": "photo", "media": img} for img in chunk]
+        if chunk_start == 0 and caption:
+            media[0]["caption"] = caption[:1024]
+        try:
+            resp = requests.post(
+                f"{TG_API}/sendMediaGroup",
+                json={"chat_id": chat_id, "media": media},
+                timeout=120,
+            )
+            if resp.status_code != 200:
+                print(f"sendMediaGroup failed {resp.status_code}: {resp.text[:300]}", flush=True)
+                return []
+            for msg in resp.json().get("result") or []:
+                photos = msg.get("photo") or []
+                if photos:
+                    file_ids.append(photos[-1].get("file_id"))
+        except Exception as exc:  # noqa: BLE001
+            print(f"sendMediaGroup failed: {exc}", flush=True)
+            return []
+    return file_ids
+
+
+def tg_send_audio_url(chat_id, audio_url, title=""):
+    """Ask Telegram to fetch an audio file from a URL. Returns the
+    audio file_id on success, else None."""
+    if not TG_API:
+        return None
+    try:
+        payload = {"chat_id": chat_id, "audio": audio_url}
+        if title:
+            payload["title"] = title[:300]
+        resp = requests.post(f"{TG_API}/sendAudio", json=payload, timeout=60)
+        if resp.status_code == 200:
+            return (resp.json().get("result") or {}).get("audio", {}).get("file_id")
+        print(f"sendAudio-by-url failed {resp.status_code}: {resp.text[:300]}", flush=True)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        print(f"sendAudio-by-url failed: {exc}", flush=True)
+        return None
+
+
+def tg_send_audio(chat_id, path, title=""):
+    """Upload an audio file. Returns the audio file_id on success."""
+    if not TG_API:
+        return None
+    try:
+        with open(path, "rb") as f:
+            data = {"chat_id": chat_id}
+            if title:
+                data["title"] = title[:300]
+            files = {"audio": (os.path.basename(path), f)}
+            resp = requests.post(f"{TG_API}/sendAudio", data=data, files=files, timeout=120)
+        if resp.status_code == 200:
+            return (resp.json().get("result") or {}).get("audio", {}).get("file_id")
+        print(f"sendAudio failed {resp.status_code}: {resp.text[:300]}", flush=True)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        print(f"sendAudio failed: {exc}", flush=True)
+        return None
+
+
+def _photo_music_url(data):
+    """Music URL from tikwm data, or '' (music is a plain string
+    in tikwm's response, and music_info.play duplicates it)."""
+    music = data.get("music")
+    if isinstance(music, str) and music.startswith("http"):
+        return music
+    info = data.get("music_info") or {}
+    if isinstance(info, dict) and info.get("play"):
+        return info["play"]
+    return ""
+
+
+def is_photo_post(url, data):
+    """True for TikTok photo posts (slideshows / single photos).
+
+    The trap: for a photo post tikwm's 'play' field is NOT a video,
+    it is the music audio URL (mime_type=audio_mpeg, duration 0).
+    Sending that through the video fast path fails, and the old
+    try_tikwm never reached its images branch because play was
+    truthy. So a post with images whose play is the music (or
+    whose duration is 0) is a photo post, not a video.
+    """
+    images = data.get("images") or []
+    if not images:
+        return False
+    play = data.get("play") or data.get("wmplay") or ""
+    if play and play == _photo_music_url(data):
+        return True
+    if data.get("duration") in (0, None) and "/photo/" in (url or ""):
+        return True
+    return False
+
+
+def send_photo_post(chat_id, url, data, tmpdir):
+    """Send a photo post: photos as a media group, music as a
+    separate audio message, then a share message whose inline
+    button shares every item (photos + audio) into a chosen chat.
+    Returns True if at least the photos were sent."""
+    images = (data.get("images") or [])[:30]
+    caption = (data.get("title") or "").strip()
+    photo_ids = tg_send_media_group(chat_id, images, caption=caption[:200] if caption else "🖼 Фото")
+    if not photo_ids:
+        return False
+    items = [("photo", fid) for fid in photo_ids]
+    music_url = _photo_music_url(data)
+    music_title = ""
+    info = data.get("music_info") or {}
+    if isinstance(info, dict):
+        music_title = (info.get("title") or "").strip()
+    audio_id = None
+    if music_url:
+        audio_id = tg_send_audio_url(chat_id, music_url, title=music_title)
+        if not audio_id:
+            # Telegram could not fetch the music URL itself:
+            # download it here and upload, same as video fallback.
+            path = os.path.join(tmpdir, "music.mp3")
+            if download_file(music_url, path):
+                audio_id = tg_send_audio(chat_id, path, title=music_title)
+    if audio_id:
+        items.append(("audio", audio_id))
+    token = _register_share_media(items)
+    tg_send_message(
+        chat_id,
+        "📸 Фото выше, звук — отдельным сообщением. Кнопка ниже поделится ими в выбранный чат (фото и звук уйдут каждое своим сообщением).",
+        reply_markup=share_keyboard(token),
+    )
+    return True
+
+
 def download_file(url, dest):
     """Stream-download a file, aborting over MAX_BYTES. Returns True on success."""
     try:
@@ -730,6 +931,9 @@ def try_tikwm(chat_id, url, tmpdir, data=None):
     if not data:
         return False
 
+    if is_photo_post(url, data):
+        return send_photo_post(chat_id, url, data, tmpdir)
+
     play = data.get("play") or data.get("wmplay") or ""
     if play:
         path = os.path.join(tmpdir, "video.mp4")
@@ -802,10 +1006,20 @@ def process_job(job):
     # still running in the worker. Do not send it again here.
     tmpdir = tempfile.mkdtemp(prefix="tiktok_")
     try:
+        # Photo posts first: their tikwm 'play' is the music, not
+        # a video, so the video fast path below would fail on them
+        # and the images would never be sent.
+        tikwm_data = get_tikwm_data(url)
+        if tikwm_data and is_photo_post(url, tikwm_data):
+            if send_photo_post(chat_id, url, tikwm_data, tmpdir):
+                record_stat("success")
+                record_stat("photos")
+                return
+            print("photo post send failed, falling back to yt-dlp", flush=True)
         # Fast path first: let Telegram fetch the direct tiktokcdn
         # URL itself. This skips the slow download + re-upload
         # through a 0.1 vCPU instance entirely.
-        tikwm_data = get_tikwm_data(url)
+        tikwm_data = tikwm_data if tikwm_data is not None else get_tikwm_data(url)
         play_url = (tikwm_data.get("play") or tikwm_data.get("wmplay") or "") if tikwm_data else ""
         if play_url:
             title = (tikwm_data.get("title") or "").strip()
@@ -841,10 +1055,13 @@ def process_job(job):
             tg_send_message(chat_id, "yt-dlp не справился, пробую запасной способ…")
             if try_tikwm(chat_id, url, tmpdir, data=tikwm_data):
                 record_stat("success")
-                record_stat("fallback")
+                record_stat("photos" if "/photo/" in url else "fallback")
                 return
             record_stat("failed")
-            tg_send_message(chat_id, "Не получилось скачать это видео. Возможно, оно приватное, удалено или слишком большое (>50 МБ).")
+            if "/photo/" in url:
+                tg_send_message(chat_id, "Это фото-пост, а не видео: фото и звук берутся только из tikwm, а yt-dlp фото-посты не поддерживает. Если tikwm сейчас недоступен с нашего IP, попробуй позже — как только он отлипнет, фото придут медиагруппой, а звук — отдельным сообщением.")
+            else:
+                tg_send_message(chat_id, "Не получилось скачать это видео. Возможно, оно приватное, удалено или слишком большое (>50 МБ).")
             return
 
         path = files[0]
@@ -921,11 +1138,21 @@ def webhook():
     inline = update.get("inline_query") or {}
     if inline:
         token = (inline.get("query") or "").strip()
-        file_id = _lookup_share(token)
         results = []
-        if file_id:
-            results = [{"type": "video", "id": token, "video_file_id": file_id,
-                        "title": "Видео"}]
+        media_items = _lookup_share_media(token)
+        if media_items:
+            for i, (kind, file_id) in enumerate(media_items):
+                if kind == "photo":
+                    results.append({"type": "photo", "id": f"{token}-p{i}",
+                                    "photo_file_id": file_id, "title": f"Фото {i + 1}"})
+                elif kind == "audio":
+                    results.append({"type": "audio", "id": f"{token}-a",
+                                    "audio_file_id": file_id, "title": "Звук"})
+        else:
+            file_id = _lookup_share(token)
+            if file_id:
+                results = [{"type": "video", "id": token, "video_file_id": file_id,
+                            "title": "Видео"}]
         tg_answer_inline_query(inline.get("id", ""), results)
         return jsonify({"ok": True}), 200
 
