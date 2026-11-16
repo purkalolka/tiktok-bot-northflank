@@ -1121,11 +1121,22 @@ def webhook():
             return jsonify({"ok": False}), 403
 
     update = request.get_json(silent=True) or {}
+    handle_update(update)
+    return jsonify({"ok": True}), 200
+
+
+def handle_update(update):
+    """Dispatch one Telegram update: inline queries, callbacks, messages.
+
+    Shared by the Flask /webhook route above and by polling.py
+    (FadeHost free tier has no webhook). Callers wrap this in
+    try/except: one bad update must never kill the poller.
+    """
     update_id = update.get("update_id")
     if update_id is not None:
         with _seen_lock:
             if update_id in _seen_updates:
-                return jsonify({"ok": True}), 200
+                return
             _seen_updates.add(update_id)
             if len(_seen_updates) > 1000:
                 _seen_updates.clear()
@@ -1154,7 +1165,7 @@ def webhook():
                 results = [{"type": "video", "id": token, "video_file_id": file_id,
                             "title": "Видео"}]
         tg_answer_inline_query(inline.get("id", ""), results)
-        return jsonify({"ok": True}), 200
+        return
 
     # --- Inline buttons (admin panel) -------------------------------
     callback = update.get("callback_query") or {}
@@ -1165,7 +1176,7 @@ def webhook():
         data = callback.get("data", "") or ""
         if not is_admin(user.get("id")):
             tg_answer_callback(callback.get("id", ""), "Нет доступа.", show_alert=True)
-            return jsonify({"ok": True}), 200
+            return
         tg_answer_callback(callback.get("id", ""))
         if data == "admin_stats":
             tg_edit_message(cb_chat.get("id"), cb_message_id, stats_text(), reply_markup=admin_back_keyboard())
@@ -1187,7 +1198,7 @@ def webhook():
             with _broadcast_lock:
                 _broadcast_waiting.discard(cb_chat.get("id"))
             tg_edit_message(cb_chat.get("id"), cb_message_id, "Рассылка отменена.", reply_markup=admin_back_keyboard())
-        return jsonify({"ok": True}), 200
+        return
 
     message = update.get("message") or {}
     chat = message.get("chat") or {}
@@ -1234,7 +1245,6 @@ def webhook():
                 tg_send_message(chat["id"], "Качаю…")
             # Return 200 BEFORE any download: this is the whole point.
             job_queue.put({"chat_id": chat["id"], "text": text})
-    return jsonify({"ok": True}), 200
 
 
 if __name__ == "__main__":
